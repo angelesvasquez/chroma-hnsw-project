@@ -14,7 +14,6 @@
 #include <set>
 #include <climits>
 #include <cstring>
-//modificado
 #include <algorithm>
 #include <cmath>
 
@@ -216,11 +215,31 @@ namespace hnswlib
         mutable std::atomic<long> metric_distance_computations{0};
         mutable std::atomic<long> metric_hops{0};
 
+        // ADSampling
+        mutable std::atomic<long> adsampling_checks_{0}; 
+        mutable std::atomic<long> adsampling_pruned_{0};
+
         bool allow_replace_deleted_ = false; // flag to replace deleted elements (marked as deleted) during insertions
         bool normalize_ = false;             // flag to normalize vectors before insertion
 
         std::mutex deleted_elements_lock;              // lock for deleted_elements
         std::unordered_set<tableint> deleted_elements; // contains internal ids of deleted elements
+
+        // Skip Connections
+        bool enable_skip_connections_ = false;
+        size_t skip_M_ = 4; // nro max de atajos por nodo
+        std::vector<std::vector<tableint>> skip_links_;   // lista de adyacencia de cada nodo
+        mutable std::vector<std::mutex> skip_link_locks_; // mutex por nodo para proteger las inserciones concurrentes de atajos
+
+        // ADSampling + PCA
+        bool enable_adsampling_ = false;
+        bool pca_trained_ = false;
+        size_t pca_dim_ = 32;
+        float adsampling_epsilon_ = 0.10f;
+        std::vector<float> pca_mean_; // [dim]
+        std::vector<float> pca_components_; 
+        std::vector<float> pca_projected_;
+        float pca_scale_ = 1.0f;
 
         bool persist_on_write_ = false;
         std::string persist_location_;
@@ -326,6 +345,10 @@ namespace hnswlib
 
             visited_list_pool_ = new VisitedListPool(1, max_elements);
 
+            // Skip-Connections
+            skip_links_.resize(max_elements_); 
+            skip_link_locks_ = std::vector<std::mutex>(max_elements_);
+
             // initializations for special treatment of the first node
             enterpoint_node_ = -1;
             maxlevel_ = -1;
@@ -336,8 +359,7 @@ namespace hnswlib
             size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
             mult_ = 1 / log(1.0 * M_);
             revSize_ = 1.0 / mult_;
-            //LOG
-            std::cout << "CUSTOM HNSW LOADED (Skip Connections ENABLED)" << std::endl;
+
             if (persist_on_write_)
             {
                 if (persist_location_.empty())
@@ -374,6 +396,159 @@ namespace hnswlib
         void setEf(size_t ef)
         {
             ef_ = ef;
+        }
+
+        void configureSkipConnections(bool enable, size_t skip_M = 4)
+        {
+            enable_skip_connections_ = enable;
+            skip_M_ = skip_M;
+        }
+
+        void configureADSampling(bool enable, size_t pca_dim = 32, float epsilon = 0.10f)
+        {
+            enable_adsampling_ = enable;
+            pca_dim_ = pca_dim;
+            adsampling_epsilon_ = epsilon;
+        }
+
+        size_t getDim() const
+        {
+            return data_size_ / sizeof(float);
+        }
+
+        double getADSamplingPruneRate() const
+        {
+            long checks = adsampling_checks_.load();
+            if (checks == 0) return 0.0;
+            return (double)adsampling_pruned_.load() / (double)checks;
+        }
+
+        void resetADSamplingCounters()
+        {
+            adsampling_checks_ = 0;
+            adsampling_pruned_ = 0;
+        }
+
+        void trainPCA(const float *flat_sample, size_t n, size_t dim) {
+            if (pca_dim_ >= dim) {
+                pca_dim_ = dim / 4 > 0 ? dim / 4 : 1;
+            }
+
+            pca_mean_.assign(dim, 0.0f);
+            for (size_t i = 0; i < n; i++){
+                for (size_t d = 0; d < dim; d++){
+                    pca_mean_[d] += flat_sample[i * dim + d];
+                }
+            }
+            for (size_t d = 0; d < dim; d++) pca_mean_[d] /= (float)n;
+
+            std::vector<double> cov(dim * dim, 0.0);
+            std::vector<float> centered(n * dim);
+            for (size_t i = 0; i < n; i++) {
+                for (size_t d = 0; d < dim; d++) {
+                    centered[i * dim + d] = flat_sample[i * dim + d] - pca_mean_[d];
+                }    
+            }
+
+            for (size_t a = 0; a < dim; a++) {
+                for (size_t b = a; b < dim; b++) {
+                    double s = 0.0;
+                    for (size_t i = 0; i < n; i++) s += (double)centered[i * dim + a] * (double)centered[i * dim + b];
+                    s /= (double)(n > 1 ? n - 1 : 1);
+                    cov[a * dim + b] = s;
+                    cov[b * dim + a] = s;
+                }
+            }
+
+            pca_components_.assign(dim * pca_dim_, 0.0f);
+            std::vector<double> work_cov = cov;
+            std::default_random_engine rng(42);
+            std::uniform_real_distribution<double> uni(-1.0, 1.0);
+
+            double total_variance = 0.0;
+            for (size_t d = 0; d < dim; d++) total_variance += cov[d * dim + d];
+            double captured_variance = 0.0;
+
+            for (size_t k = 0; k < pca_dim_; k++) {
+                std::vector<double> v(dim);
+                for (size_t d = 0; d < dim; d++) v[d] = uni(rng);
+
+                for (int iter = 0; iter < 100; iter++) {
+                    std::vector<double> v_new(dim, 0.0);
+                    for (size_t a = 0; a < dim; a++) {
+                        double s = 0.0;
+                        for (size_t b = 0; b < dim; b++){
+                            s += work_cov[a * dim + b] * v[b];
+                        }
+                        v_new[a] = s;
+                    }
+
+                    double norm = 0.0;
+                    for (size_t d = 0; d < dim; d++) norm += v_new[d] * v_new[d];
+                    norm = std::sqrt(norm);
+
+                    if (norm < 1e-12) break;
+                    for (size_t d = 0; d < dim; d++) v_new[d] /= norm;
+                    v = v_new;
+                }
+
+                for (size_t row = 0; row < dim; ++row) {
+                    pca_components_[row * pca_dim_ + k] = static_cast<float>(v[row]);
+                }
+
+                double eigval = 0.0;
+                std::vector<double> tmp(dim, 0.0);
+
+                for (size_t row = 0; row < dim; ++row) {
+                    double sum = 0.0;
+                    for (size_t col = 0; col < dim; ++col) {
+                        sum += work_cov[row * dim + col] * v[col];
+                    }
+                    tmp[row] = sum;
+                }
+
+                for (size_t i = 0; i < dim; ++i) {
+                    eigval += tmp[i] * v[i];
+                }
+
+                captured_variance += eigval;
+
+                for (size_t row = 0; row < dim; ++row) {
+                    for (size_t col = 0; col < dim; ++col) {
+                        work_cov[row * dim + col] -= eigval * v[row] * v[col];
+                    }
+                }
+            }
+
+            pca_scale_ = captured_variance > 1e-9 ? (float)(total_variance / captured_variance) : 1.0f;
+
+            pca_projected_.assign(max_elements_ * pca_dim_, 0.0f);
+            pca_trained_ = true;
+
+            for (tableint i = 0; i < cur_element_count; i++) {
+                projectVector((const float *)getDataByInternalId(i), &pca_projected_[i * pca_dim_]);
+            }
+        }
+
+        void projectVector(const float *raw, float *out) const {
+            size_t dim = getDim();
+            for (size_t k = 0; k < pca_dim_; k++) {
+                double s = 0.0;
+                for (size_t d = 0; d < dim; d++)
+                    s += (double)(raw[d] - pca_mean_[d]) * (double)pca_components_[d * pca_dim_ + k];
+                out[k] = (float)s;
+            }
+        }
+
+        inline float approxSquaredDistance(const float *query_proj, tableint candidate_id) const {
+            const float *cand_proj = &pca_projected_[candidate_id * pca_dim_];
+            float s = 0.0f;
+            for (size_t k = 0; k < pca_dim_; k++) {
+                float diff = query_proj[k] - cand_proj[k];
+                s += diff * diff;
+            }
+            float scale = pca_scale_;
+            return s * scale;
         }
 
         inline std::mutex &getLabelOpMutex(labeltype label) const
@@ -546,6 +721,14 @@ namespace hnswlib
             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
+            // ADSampling
+            bool use_adsampling = enable_adsampling_ && pca_trained_;
+            std::vector<float> query_proj;
+            if (use_adsampling) {
+                query_proj.resize(pca_dim_);
+                projectVector((const float *)data_point, query_proj.data());
+            }
+
             dist_t lowerBound;
             if ((!has_deletions || !isMarkedDeleted(ep_id)) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))
             {
@@ -562,13 +745,45 @@ namespace hnswlib
 
             visited_array[ep_id] = visited_array_tag;
 
-            while (!candidate_set.empty())
-            {
+            auto processCandidate = [&](tableint candidate_id) -> bool {
+                if (visited_array[candidate_id] == visited_array_tag) return false;
+                
+                visited_array[candidate_id] = visited_array_tag;
+
+                // ADSampling
+                if (use_adsampling && top_candidates.size() >= ef) {
+                    adsampling_checks_++;
+                    float approx = approxSquaredDistance(query_proj.data(), candidate_id);
+                    float threshold = lowerBound;
+                    if (approx > threshold * (1.0f + adsampling_epsilon_)) {
+                        adsampling_pruned_++;
+                        return false;
+                    }
+                }
+
+                char *currObj1 = (getDataByInternalId(candidate_id));
+                dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_); //distancia
+
+                if (top_candidates.size() < ef || lowerBound > dist) {
+                    candidate_set.emplace(-dist, candidate_id);
+
+                    if ((!has_deletions || !isMarkedDeleted(candidate_id)) 
+                        && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id)))) {
+                        top_candidates.emplace(dist, candidate_id);
+                    }
+
+                    if (top_candidates.size() > ef) top_candidates.pop();
+
+                    if (!top_candidates.empty()) lowerBound = top_candidates.top().first;
+                }
+                return true;
+            };
+
+            while (!candidate_set.empty()) {
                 std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
 
                 if ((-current_node_pair.first) > lowerBound &&
-                    (top_candidates.size() == ef || (!isIdAllowed && !has_deletions)))
-                {
+                    (top_candidates.size() == ef || (!isIdAllowed && !has_deletions))){
                     break;
                 }
                 candidate_set.pop();
@@ -576,54 +791,19 @@ namespace hnswlib
                 tableint current_node_id = current_node_pair.second;
                 int *data = (int *)get_linklist0(current_node_id);
                 size_t size = getListCount((linklistsizeint *)data);
-                //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
-                if (collect_metrics)
-                {
+                if (collect_metrics) {
                     metric_hops++;
                     metric_distance_computations += size;
                 }
 
-#ifdef USE_SSE
-                _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
-                _mm_prefetch((char *)(visited_array + *(data + 1) + 64), _MM_HINT_T0);
-                _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
-                _mm_prefetch((char *)(data + 2), _MM_HINT_T0);
-#endif
+                for (size_t j = 1; j <= size; j++) {
+                    tableint candidate_id = *(data + j);
+                    processCandidate(candidate_id);
+                }
 
-                for (size_t j = 1; j <= size; j++)
-                {
-                    int candidate_id = *(data + j);
-//                    if (candidate_id == 0) continue;
-#ifdef USE_SSE
-                    _mm_prefetch((char *)(visited_array + *(data + j + 1)), _MM_HINT_T0);
-                    _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                 _MM_HINT_T0); ////////////
-#endif
-                    if (!(visited_array[candidate_id] == visited_array_tag))
-                    {
-                        visited_array[candidate_id] = visited_array_tag;
-
-                        char *currObj1 = (getDataByInternalId(candidate_id));
-                        dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
-
-                        if (top_candidates.size() < ef || lowerBound > dist)
-                        {
-                            candidate_set.emplace(-dist, candidate_id);
-#ifdef USE_SSE
-                            _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
-                                             offsetLevel0_, ///////////
-                                         _MM_HINT_T0);      ////////////////////////
-#endif
-
-                            if ((!has_deletions || !isMarkedDeleted(candidate_id)) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))
-                                top_candidates.emplace(dist, candidate_id);
-
-                            if (top_candidates.size() > ef)
-                                top_candidates.pop();
-
-                            if (!top_candidates.empty())
-                                lowerBound = top_candidates.top().first;
-                        }
+                if (enable_skip_connections_ && current_node_id < skip_links_.size()) {
+                    for (tableint skip_candidate_id : skip_links_[current_node_id]) {
+                        processCandidate(skip_candidate_id);
                     }
                 }
             }
@@ -2042,7 +2222,95 @@ namespace hnswlib
                 enterpoint_node_ = cur_c;
                 maxlevel_ = curlevel;
             }
+
+            // ADSampling
+            if (enable_adsampling_ && pca_trained_ && cur_c < pca_projected_.size() / pca_dim_)
+            {
+                projectVector((const float *)normalized_vector, &pca_projected_[cur_c * pca_dim_]);
+            }
+
+            // Skip Connections
+            if (enable_skip_connections_) {
+                addSkipConnectionsForElement(cur_c);
+            }
+
             return cur_c;
+        }
+
+        void addSkipConnectionsForElement(tableint cur_c)
+        {
+            if (cur_c >= cur_element_count) return;
+
+            std::unordered_set<tableint> direct_neighbors;
+            {
+                int *data = (int *)get_linklist0(cur_c);
+                size_t size = getListCount((linklistsizeint *)data);
+                for (size_t j = 1; j <= size; j++){
+                    direct_neighbors.insert((tableint)*(data + j));
+                }
+            }
+            direct_neighbors.insert(cur_c);
+
+            std::unordered_set<tableint> two_hop_candidates;
+            for (tableint n : direct_neighbors){
+                if (n == cur_c) continue;
+
+                int *data = (int *)get_linklist0(n);
+                size_t size = getListCount((linklistsizeint *)data);
+                for (size_t j = 1; j <= size; j++){
+                    tableint cand = (tableint)*(data + j);
+                    if (direct_neighbors.find(cand) == direct_neighbors.end()){
+                        two_hop_candidates.insert(cand);
+                    }
+                }
+            }
+
+            if (two_hop_candidates.empty()) return;
+
+            std::vector<std::pair<dist_t, tableint>> candidates_by_dist;
+            candidates_by_dist.reserve(two_hop_candidates.size());
+
+            for (tableint cand : two_hop_candidates) {
+                dist_t d = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(cand), dist_func_param_);
+                candidates_by_dist.emplace_back(d, cand);
+            }
+             std::sort(candidates_by_dist.begin(), candidates_by_dist.end(), CompareByFirst());
+
+            size_t added = 0;
+            for (auto &p : candidates_by_dist) {
+                if (added >= skip_M_) break;
+                tableint cand = p.second;
+                dist_t d = p.first;
+                addSkipEdge(cur_c, cand, d);
+                addSkipEdge(cand, cur_c, d);
+                added++;
+            }
+        }
+
+        void addSkipEdge(tableint from, tableint to, dist_t dist_to)
+        {
+            std::unique_lock<std::mutex> lock(skip_link_locks_[from]);
+            auto &links = skip_links_[from];
+
+            for (tableint existing : links){
+                if (existing == to) return;
+            }
+
+            if (links.size() < skip_M_) {
+                links.push_back(to);
+                return;
+            }
+
+            size_t worst_idx = 0;
+            dist_t worst_dist = fstdistfunc_(getDataByInternalId(from), getDataByInternalId(links[0]), dist_func_param_);
+            for (size_t i = 1; i < links.size(); i++) {
+                dist_t d = fstdistfunc_(getDataByInternalId(from), getDataByInternalId(links[i]), dist_func_param_);
+                if (d > worst_dist) {
+                    worst_dist = d;
+                    worst_idx = i;
+                }
+            }
+            if (dist_to < worst_dist) links[worst_idx] = to;
         }
 
         std::priority_queue<std::pair<dist_t, labeltype>>
