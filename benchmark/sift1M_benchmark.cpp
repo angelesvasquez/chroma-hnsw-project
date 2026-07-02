@@ -58,11 +58,7 @@ std::vector<std::vector<int>> loadIvecsGroundtruth(const std::string &path, size
     return gt;
 }
 
-void runMode(const std::string &mode, hnswlib::L2Space &space,
-             const std::vector<float> &queries, size_t n_query, size_t dim,
-             const std::vector<std::vector<int>> &gt,
-             const std::vector<float> &base, size_t n_base,
-             const std::vector<size_t> &ef_values) {
+void runMode(const std::string &mode, hnswlib::L2Space &space, const std::vector<float> &queries, size_t n_query, size_t dim, const std::vector<std::vector<int>> &gt, const std::vector<float> &base, size_t n_base, const std::vector<size_t> &ef_values) {
 
     bool enable_skip = (mode == "skip" || mode == "skipads");
     bool enable_ads  = (mode == "ads"  || mode == "skipads");
@@ -89,9 +85,7 @@ void runMode(const std::string &mode, hnswlib::L2Space &space,
         auto t1 = Clock::now();
         double seconds = std::chrono::duration<double>(t1 - t0).count();
 
-        std::cout << "ef_search=" << ef
-                   << "  recall@10=" << (double)hits / (double)(n_query * K)
-                   << "  QPS=" << (double)n_query / seconds;
+        std::cout << "ef_search=" << ef << "  recall@10=" << (double)hits / (double)(n_query * K) << "  QPS=" << (double)n_query / seconds;
         if (enable_ads) std::cout << "  prune_rate=" << index.getADSamplingPruneRate();
         std::cout << "\n";
     }
