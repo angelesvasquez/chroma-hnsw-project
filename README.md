@@ -88,7 +88,9 @@ git clone https://github.com/chroma-core/chroma.git
 Colocar este proyecto (`hnswlib/` con `hnswalg.h` modificado) en un directorio paralelo al repositorio de Chroma:
 
 ```
-workspace/├── chroma/└── hnswlib/
+workspace/
+├── chroma/
+└── hnswlib/
 ```
 
 Esto permite referenciar la implementación local mediante ruta relativa.
