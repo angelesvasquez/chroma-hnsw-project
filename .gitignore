@@ -1,3 +1,6 @@
-comparar1.h
-comparar3.h
 /chroma
+.vscode/
+*.exe
+*.o
+benchmark/sift1M/
+benchmark/gist/
